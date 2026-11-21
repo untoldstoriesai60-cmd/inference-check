@@ -1,0 +1,17 @@
+{
+  "structured_output": {
+    "prompt": "Return order_id ORD-42 and status confirmed in the requested JSON schema.",
+    "expected": {
+      "order_id": "ORD-42",
+      "status": "confirmed"
+    }
+  },
+  "tool_call": {
+    "prompt": "Call lookup_order with order_id ORD-42. Use that exact value.",
+    "name": "lookup_order",
+    "description": "Look up an order by its ID.",
+    "expected_arguments": {
+      "order_id": "ORD-42"
+    }
+  }
+}
