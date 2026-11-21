@@ -48,22 +48,33 @@ python3 inference_check.py check \
 
 Adicione `--openrouter-provider SLUG` para solicitar um upstream específico sem fallback entre provedores. A comparação usa a rota solicitada. Sem fixação, as chamadas podem cair em upstreams diferentes.
 
+### Use um caso do seu app
+
+Adicione `--case examples/order.json` ao comando da rota ou crie seu próprio arquivo. O exemplo testa uma saída JSON e a função `lookup_order`, com e sem streaming. Um arquivo com apenas `structured_output` faz uma chamada por amostra. Um arquivo com apenas `tool_call` faz duas.
+
+- `structured_output` recebe `prompt` e o objeto JSON `expected`.
+- `tool_call` recebe `prompt`, `name`, `description` e o objeto JSON `expected_arguments`. A CLI valida a chamada sem executar a função.
+
+A CLI deriva o schema de cada exemplo e verifica as chaves, os tipos e os valores retornados. A ordem dos campos de um objeto pode variar. Em arrays, a ordem dos elementos faz parte do resultado esperado. Use prompts e valores sintéticos, pois o endpoint vai recebê-los. O relatório inclui o hash do caso para impedir comparações com um teste diferente.
+
 ### Comparar no CI
 
 Repita o comando da rota com `--baseline baseline-openai.json --output atual-openai.json`, usando a mesma configuração registrada no baseline. Guarde o relatório de uma execução saudável como referência e preserve o atual mesmo se o passo falhar.
 
+O padrão exige 100% de aprovação por teste. Para tolerar uma oscilação pequena, passe `--min-pass-rate 90`. Com um baseline, `--max-baseline-drop 5` também reprova qualquer teste que caia mais de cinco pontos percentuais em relação ao resultado anterior. Por exemplo, cair de 100% para 93% ainda passa pelo mínimo de 90%, mas reprova pelo limite de queda. Baselines da v0.1.0 continuam válidos para o caso padrão.
+
 | Código | Significado |
 | --- | --- |
-| 0 | Todas as amostras passaram. |
-| 1 | Ao menos uma amostra falhou. Consulte as contagens e motivos no relatório. |
+| 0 | Todos os testes ficaram dentro dos limites configurados. |
+| 1 | Ao menos um teste ficou fora de um limite. Consulte as contagens e motivos no relatório. |
 | 2 | Erro nos argumentos, na configuração, no baseline ou ao salvar o relatório. |
 
-O relatório JSON inclui horário UTC, versão da suíte, configuração da rota, contagem de passes e de HTTP 200, e motivos de falha. O baseline acrescenta a contagem anterior e o terminal mostra a diferença em pontos percentuais. A CLI usa prompts fixos e deixa chaves e respostas brutas fora do relatório. Falhas de transporte, status HTTP e falhas de contrato aparecem com motivos distintos.
+O relatório JSON inclui horário UTC, versão da suíte, configuração da rota, contagem de passes e de cada status HTTP recebido, motivos de falha e limites de CI. O baseline acrescenta a contagem anterior e o terminal mostra a diferença em pontos percentuais. Chaves, prompts e respostas brutas ficam fora do relatório. Falhas de transporte, status como 401 ou 429 e falhas de contrato aparecem com motivos distintos.
 
 A suíte mede esses três contratos no endpoint configurado e na amostra executada. Os resultados documentam o comportamento observado. Identidade do modelo, cobrança, retenção e localização do processamento exigem evidências próprias. As duas configurações de provedores acima são exemplos. A demo local verifica a execução e a detecção de regressão sem acessar APIs pagas.
 
 ## Contribuição
 
-Para propor um novo teste, inclua um caso sintético, o critério de passagem e um exemplo de falha reproduzível. Execute `python3 demo.py` antes de enviar a mudança. O workflow do repositório roda essa demo em Python 3.10 e 3.12.
+Para propor um novo teste, inclua um caso sintético, o critério de passagem e um exemplo de falha reproduzível. Execute `python3 demo.py` e `python3 -m unittest` antes de enviar a mudança. O workflow do repositório roda ambos em Python 3.10 e 3.12.
 
 Licença [Apache-2.0](LICENSE).

@@ -2,33 +2,37 @@
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from fractions import Fraction
+from hashlib import sha256
 from http.client import HTTPException
 import json
+import math
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-VERSION = "0.1.0"
-SCHEMA = {
-    "type": "object",
-    "properties": {"city": {"type": "string"}, "days": {"type": "integer"}},
-    "required": ["city", "days"],
-    "additionalProperties": False,
+VERSION = "0.2.0"
+DEFAULT_CASE = {
+    "structured_output": {
+        "prompt": 'Return city "Recife" and days 2 in the requested JSON schema.',
+        "expected": {"city": "Recife", "days": 2},
+    },
+    "tool_call": {
+        "prompt": 'Call get_forecast for "Recife" with days set to 2.',
+        "name": "get_forecast",
+        "description": "Get the forecast for a city and number of days.",
+        "expected_arguments": {"city": "Recife", "days": 2},
+    },
 }
-EXPECTED = {"city": "Recife", "days": 2}
-FUNCTION = {
-    "name": "get_forecast",
-    "description": "Get the forecast for a city and number of days.",
-    "parameters": SCHEMA,
-    "strict": True,
-}
-CHECKS = ("structured_output", "tool_call", "streaming_tool_call")
 MAX_BYTES = 1_048_576
+JSON_TYPES = {str: "string", int: "integer", float: "number", bool: "boolean", type(None): "null"}
 
 
 class ProbeFailure(Exception):
@@ -40,27 +44,117 @@ class NoRedirects(HTTPRedirectHandler):
         return None
 
 
-def request_payload(route, check):
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def example_schema(value):
+    if isinstance(value, dict):
+        return {
+            "type": "object",
+            "properties": {key: example_schema(item) for key, item in value.items()},
+            "required": list(value),
+            "additionalProperties": False,
+        }
+    if isinstance(value, list):
+        schemas = {}
+        for item in value:
+            schema = example_schema(item)
+            schemas[canonical_json(schema)] = schema
+        items = list(schemas.values())
+        if len(items) > 1:
+            return {"type": "array", "items": {"anyOf": items}}
+        return {"type": "array", "items": items[0] if items else {"type": "null"}}
+    return {"type": JSON_TYPES[type(value)]}
+
+
+def matches_schema(value, schema):
+    if "anyOf" in schema:
+        return any(matches_schema(value, option) for option in schema["anyOf"])
+    kind = schema["type"]
+    if kind == "object":
+        properties = schema["properties"]
+        return isinstance(value, dict) and value.keys() == properties.keys() and all(
+            matches_schema(value[key], field) for key, field in properties.items()
+        )
+    if kind == "array":
+        return isinstance(value, list) and all(matches_schema(item, schema["items"]) for item in value)
+    return JSON_TYPES.get(type(value)) == kind or (kind == "number" and type(value) is int)
+
+
+@dataclass(frozen=True)
+class ProbeCase:
+    prompt: str
+    expected: dict
+    schema: dict
+    name: str
+    description: str = ""
+
+
+def prepare_cases(spec, structured_name="expected_response"):
+    if not isinstance(spec, dict) or not spec or spec.keys() - DEFAULT_CASE.keys():
+        raise ValueError("o caso deve conter structured_output, tool_call ou ambos")
+    cases = {}
+    for check in DEFAULT_CASE:
+        if check not in spec:
+            continue
+        config = spec[check]
+        if not isinstance(config, dict) or config.keys() != DEFAULT_CASE[check].keys():
+            fields = ", ".join(DEFAULT_CASE[check])
+            raise ValueError(f"{check} deve conter os campos {fields}")
+        prompt = config["prompt"]
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"{check}.prompt deve ser um texto não vazio")
+        structured = check == "structured_output"
+        name = structured_name if structured else config["name"]
+        description = "" if structured else config["description"]
+        if not isinstance(name, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name):
+            raise ValueError("tool_call.name deve ter de 1 a 64 letras ASCII, números, hífens ou sublinhados")
+        if not isinstance(description, str):
+            raise ValueError("tool_call.description deve ser um texto")
+        expected = config["expected"] if structured else config["expected_arguments"]
+        if not isinstance(expected, dict):
+            raise ValueError(f"a resposta esperada de {check} deve ser um objeto JSON")
+        cases[check] = ProbeCase(prompt, expected, example_schema(expected), name, description)
+    if "tool_call" in cases:
+        cases["streaming_tool_call"] = cases["tool_call"]
+    return cases
+
+
+DEFAULT_CASES = prepare_cases(DEFAULT_CASE, structured_name="forecast_request")
+
+
+def load_cases(path):
+    if path is None:
+        return DEFAULT_CASES, None
+    try:
+        encoded = canonical_json(json.loads(path.read_text(encoding="utf-8")))
+        cases = prepare_cases(json.loads(encoded))
+    except (RecursionError, OverflowError) as error:
+        raise ValueError("o caso JSON é complexo demais") from error
+    return cases, sha256(encoded.encode()).hexdigest()
+
+
+def request_payload(route, check, case=None):
+    if case is None:
+        case = DEFAULT_CASES[check]
     structured = check == "structured_output"
     payload = {
         "model": route["model"],
-        "messages": [{
-            "role": "user",
-            "content": (
-                'Return city "Recife" and days 2 in the requested JSON schema.'
-                if structured else 'Call get_forecast for "Recife" with days set to 2.'
-            ),
-        }],
+        "messages": [{"role": "user", "content": case.prompt}],
         "stream": check == "streaming_tool_call",
     }
     if structured:
         payload["response_format"] = {
             "type": "json_schema",
-            "json_schema": {"name": "forecast_request", "schema": SCHEMA, "strict": True},
+            "json_schema": {"name": case.name, "schema": case.schema, "strict": True},
         }
     else:
-        payload["tools"] = [{"type": "function", "function": FUNCTION}]
-        payload["tool_choice"] = {"type": "function", "function": {"name": FUNCTION["name"]}}
+        function = {
+            "name": case.name, "description": case.description, "parameters": case.schema, "strict": True,
+        }
+        payload["tools"] = [{"type": "function", "function": function}]
+        payload["tool_choice"] = {"type": "function", "function": {"name": case.name}}
     if route["upstream"]:
         payload["provider"] = {
             "only": [route["upstream"]],
@@ -70,33 +164,27 @@ def request_payload(route, check):
     return payload
 
 
-def check_fields(value):
-    # This probe uses a fixed schema with two required fields and no extras.
-    if (
-        not isinstance(value, dict)
-        or value.keys() != EXPECTED.keys()
-        or not isinstance(value["city"], str)
-        or type(value["days"]) is not int
-    ):
+def check_fields(value, case):
+    if not matches_schema(value, case.schema):
         raise ProbeFailure("schema_mismatch")
-    if value != EXPECTED:
+    if canonical_json(value) != canonical_json(case.expected):
         raise ProbeFailure("unexpected_values")
 
 
-def check_tool(call):
+def check_tool(call, case):
     function = call["function"]
     if call["type"] != "function" or not isinstance(call["id"], str) or not call["id"]:
         raise ProbeFailure("invalid_tool_call")
-    if function["name"] != FUNCTION["name"]:
+    if function["name"] != case.name:
         raise ProbeFailure("unexpected_tool")
     try:
         value = json.loads(function["arguments"])
     except (ValueError, TypeError):
         raise ProbeFailure("invalid_tool_arguments_json") from None
-    check_fields(value)
+    check_fields(value, case)
 
 
-def check_completion(response, check):
+def check_completion(response, check, case):
     body = response.read(MAX_BYTES + 1)
     if len(body) > MAX_BYTES:
         raise ProbeFailure("response_too_large")
@@ -114,14 +202,14 @@ def check_completion(response, check):
             value = json.loads(message["content"])
         except (TypeError, ValueError):
             raise ProbeFailure("invalid_structured_json") from None
-        check_fields(value)
+        check_fields(value, case)
     else:
         if choice["finish_reason"] != "tool_calls":
             raise ProbeFailure("unexpected_finish_reason")
         calls = message["tool_calls"]
         if not isinstance(calls, list) or len(calls) != 1:
             raise ProbeFailure("unexpected_tool_call_count")
-        check_tool(calls[0])
+        check_tool(calls[0], case)
 
 
 def sse_events(response):
@@ -144,7 +232,7 @@ def sse_events(response):
             fields.append(value[1:] if value.startswith(b" ") else value)
 
 
-def check_stream(response):
+def check_stream(response, case):
     if response.headers.get_content_type() != "text/event-stream":
         raise ProbeFailure("expected_event_stream")
     calls = {}
@@ -176,16 +264,16 @@ def check_stream(response):
         raise ProbeFailure("unexpected_finish_reason")
     if set(calls) != {0}:
         raise ProbeFailure("unexpected_tool_call_count")
-    check_tool(calls[0])
+    check_tool(calls[0], case)
 
 
-def run_probe(opener, route, check, token):
+def run_probe(opener, route, check, token, case):
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if check == "streaming_tool_call":
         headers["Accept"] = "text/event-stream"
-    data = json.dumps(request_payload(route, check)).encode()
+    data = json.dumps(request_payload(route, check, case)).encode()
     request = Request(route["url"], data=data, headers=headers, method="POST")
     status = None
     try:
@@ -194,42 +282,50 @@ def run_probe(opener, route, check, token):
             if status != 200:
                 raise ProbeFailure("unexpected_http_status")
             if check == "streaming_tool_call":
-                check_stream(response)
+                check_stream(response, case)
             else:
-                check_completion(response, check)
+                check_completion(response, check, case)
     except HTTPError as error:
         error.close()
         return error.code, "unexpected_http_status"
     except ProbeFailure as error:
         return status, str(error)
-    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+    except (AttributeError, IndexError, KeyError, RecursionError, TypeError, ValueError):
         return status, "invalid_response_format"
     except (OSError, HTTPException):
         return status, "transport_error"
     return status, None
 
 
-def run_suite(route, samples, token):
+def run_suite(route, samples, token, cases=DEFAULT_CASES, case_sha256=None):
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     opener = build_opener(NoRedirects())
     checks = {}
-    for check in CHECKS:
-        outcomes = [run_probe(opener, route, check, token) for _ in range(samples)]
+    for check, case in cases.items():
+        outcomes = [run_probe(opener, route, check, token, case) for _ in range(samples)]
+        statuses = Counter(status for status, _ in outcomes if status is not None)
         checks[check] = {
             "total": samples,
             "passed": sum(reason is None for _, reason in outcomes),
-            "http_200": sum(status == 200 for status, _ in outcomes),
+            "http_200": statuses[200],
+            "http_statuses": {str(status): statuses[status] for status in sorted(statuses)},
             "failures": dict(Counter(reason for _, reason in outcomes if reason)),
         }
-    return {"version": VERSION, "started_at": started, "route": route, "checks": checks}
+    return {
+        "version": VERSION, "started_at": started, "route": route,
+        "case_sha256": case_sha256, "checks": checks,
+    }
 
 
-def load_baseline(path, route):
+def load_baseline(path, route, cases, case_sha256):
     report = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(report, dict) or report.get("version") != VERSION or report.get("route") != route:
+    supported_versions = (VERSION,) if case_sha256 is not None else (VERSION, "0.1.0")
+    if not isinstance(report, dict) or report.get("version") not in supported_versions or report.get("route") != route:
         raise ValueError("baseline incompatível com a versão da suíte ou configuração da rota")
+    if report.get("case_sha256") != case_sha256:
+        raise ValueError("baseline incompatível com o caso de teste")
     checks = report.get("checks")
-    if not isinstance(checks, dict) or set(checks) != set(CHECKS):
+    if not isinstance(checks, dict) or set(checks) != set(cases):
         raise ValueError("baseline com testes ausentes ou inválidos")
     for result in checks.values():
         if not isinstance(result, dict):
@@ -249,10 +345,39 @@ def print_summary(report):
               f"HTTP 200 em {result['http_200']}/{result['total']}")
         for reason, count in result["failures"].items():
             print(f"    {reason}: {count}")
+        for status, count in result["http_statuses"].items():
+            if status != "200":
+                print(f"    HTTP {status}: {count}")
         if "baseline" in report:
             previous = report["baseline"]["checks"][check]
             delta = 100 * (result["passed"] / result["total"] - previous["passed"] / previous["total"])
             print(f"    baseline: {previous['passed']}/{previous['total']} ({delta:+.1f} p.p.)")
+    for violation in report.get("gate", {}).get("violations", []):
+        print(f"  Limite de CI excedido em {violation['check']} ({violation['reason']}).")
+
+
+def evaluate_gate(report, minimum, max_drop):
+    violations = []
+    for check, result in report["checks"].items():
+        rate = Fraction(result["passed"] * 100, result["total"])
+        if rate < Fraction(str(minimum)):
+            violations.append({"check": check, "reason": "min_pass_rate"})
+        if max_drop is not None:
+            previous = report["baseline"]["checks"][check]
+            previous_rate = Fraction(previous["passed"] * 100, previous["total"])
+            if previous_rate - rate > Fraction(str(max_drop)):
+                violations.append({"check": check, "reason": "max_baseline_drop"})
+    return {"min_pass_rate": minimum, "max_baseline_drop": max_drop, "violations": violations}
+
+
+def percentage(text):
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("esperado um número entre 0 e 100") from None
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError("esperado um número entre 0 e 100")
+    return value
 
 
 def check_command(args):
@@ -266,6 +391,8 @@ def check_command(args):
         raise ValueError("informe uma URL HTTPS completa, sem credenciais, query ou fragmento")
     if args.samples < 1 or args.timeout < 1:
         raise ValueError("--samples e --timeout devem ser maiores que zero")
+    if args.max_baseline_drop is not None and args.baseline is None:
+        raise ValueError("--max-baseline-drop requer --baseline")
     token = os.environ.get(args.key_env) if args.key_env else None
     if args.key_env and not token:
         raise ValueError(f"variável de ambiente ausente ou vazia: {args.key_env}")
@@ -273,8 +400,9 @@ def check_command(args):
         "name": args.name, "url": args.url, "model": args.model,
         "upstream": args.openrouter_provider, "timeout_seconds": args.timeout,
     }
-    baseline = load_baseline(args.baseline, route) if args.baseline else None
-    report = run_suite(route, args.samples, token)
+    cases, case_sha256 = load_cases(args.case)
+    baseline = load_baseline(args.baseline, route, cases, case_sha256) if args.baseline else None
+    report = run_suite(route, args.samples, token, cases, case_sha256)
     if baseline:
         report["baseline"] = {
             "started_at": baseline["started_at"],
@@ -283,6 +411,7 @@ def check_command(args):
                 for check, result in baseline["checks"].items()
             },
         }
+    report["gate"] = evaluate_gate(report, args.min_pass_rate, args.max_baseline_drop)
     if args.output:
         # A failed write must not leave a partial report or overwrite a valid baseline.
         with tempfile.NamedTemporaryFile(
@@ -297,7 +426,7 @@ def check_command(args):
             finally:
                 temporary_path.unlink(missing_ok=True)
     print_summary(report)
-    return int(any(check["passed"] < check["total"] for check in report["checks"].values()))
+    return int(bool(report["gate"]["violations"]))
 
 
 def main():
@@ -312,7 +441,12 @@ def main():
     check.add_argument("--openrouter-provider", help="slug do provedor a fixar no OpenRouter")
     check.add_argument("--samples", type=int, default=3, help="número de chamadas por teste")
     check.add_argument("--timeout", type=int, default=30, help="timeout de rede em segundos")
+    check.add_argument("--case", type=Path, help="arquivo JSON com prompts e resultados esperados")
     check.add_argument("--baseline", type=Path, help="relatório JSON anterior")
+    check.add_argument("--min-pass-rate", type=percentage, default=100.0,
+                       help="percentual mínimo de aprovação por teste, padrão 100")
+    check.add_argument("--max-baseline-drop", type=percentage,
+                       help="queda máxima permitida por teste em pontos percentuais")
     check.add_argument("--output", type=Path, help="caminho para salvar o relatório JSON")
     args = parser.parse_args()
     try:

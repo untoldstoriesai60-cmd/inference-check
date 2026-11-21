@@ -89,7 +89,8 @@ def main():
 
     report = json.loads(current.read_text(encoding="utf-8"))
     if report["checks"]["streaming_tool_call"] != {
-        "total": 10, "passed": 6, "http_200": 10, "failures": {"invalid_tool_arguments_json": 4},
+        "total": 10, "passed": 6, "http_200": 10, "http_statuses": {"200": 10},
+        "failures": {"invalid_tool_arguments_json": 4},
     }:
         sys.exit("Demo falhou. Esperava exatamente quatro streams com argumentos incompletos.")
     if any(report["checks"][check]["passed"] != 10 for check in ("structured_output", "tool_call")):
